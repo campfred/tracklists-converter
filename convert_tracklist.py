@@ -1,4 +1,4 @@
-import argparse, yaml, pathlib, enum, typing, csv
+import argparse, yaml, pathlib, enum, typing, csv, mimetypes
 from datetime import datetime
 
 
@@ -30,12 +30,39 @@ arguments_parser.add_argument(
     help="Do not write music label info.",
     default=False,
 )
+cue_group = arguments_parser.add_argument_group("cue sheet options")
+cue_group.add_argument(
+    "--audio-file",
+    type=str,
+    help="Path to the audio file (required for CUE sheet generation)",
+    default=None,
+)
+cue_group.add_argument(
+    "--audio-type",
+    type=str,
+    choices=["MP3", "WAVE", "AIFF"],
+    help="Type of the audio file for CUE sheet. If not specified, it will be detected automatically.",
+    default=None,
+)
+cue_group.add_argument(
+    "--mix-title",
+    type=str,
+    help="Title of the mix for CUE sheet",
+    default="DJ Mix",
+)
+cue_group.add_argument(
+    "--mix-performer",
+    type=str,
+    help="Performer name for CUE sheet",
+    default="Various Artists",
+)
+
 format_group = arguments_parser.add_argument_group("output formats")
 format_group.add_argument(
     "--format",
     type=str,
-    choices=["Main", "Telegram", "Lyrics"],
-    help="The format type(s) to export (Main, Telegram, or Lyrics). Can be specified multiple times.",
+    choices=["Main", "Telegram", "Lyrics", "CUE"],
+    help="The format type(s) to export (Main, Telegram, Lyrics, or CUE). Can be specified multiple times.",
     action="append",
     default=[],
 )
@@ -57,6 +84,12 @@ format_group.add_argument(
     help="Export in Lyrics format",
     default=False,
 )
+format_group.add_argument(
+    "--cue",
+    action="store_true",
+    help="Export in CUE sheet format",
+    default=False,
+)
 arguments = arguments_parser.parse_args()
 
 # Combine format flags with format argument
@@ -67,6 +100,11 @@ if arguments.telegram:
     selected_formats.append("Telegram")
 if arguments.lyrics:
     selected_formats.append("Lyrics")
+if arguments.cue:
+    if not arguments.audio_file:
+        print("❗ Error: --audio-file is required when generating CUE sheet format")
+        exit(1)
+    selected_formats.append("CUE")
 
 # If no format was specified, default to Main
 if not selected_formats:
@@ -84,11 +122,49 @@ class TracklistFormats(enum.Enum):
     Default = "Main"
     Telegram = "Telegram"
     Lyrics = "Lyrics"
+    CUE = "CUE"
+
+
+def detect_audio_type(file_path: str) -> str:
+    """Detect the type of audio file and return the appropriate CUE format type."""
+    if not file_path:
+        return "MP3"  # Default if no file specified
+    
+    path = pathlib.Path(file_path)
+    if not path.exists():
+        print(f"⚠️  Warning: Audio file {file_path} not found. Using extension to guess type.")
+    
+    # Initialize mimetypes
+    mimetypes.init()
+    
+    # Get the mime type based on file extension
+    mime_type, _ = mimetypes.guess_type(file_path)
+    
+    if mime_type:
+        if "audio/mpeg" in mime_type or "audio/mp3" in mime_type:
+            return "MP3"
+        elif "audio/wav" in mime_type or "audio/x-wav" in mime_type:
+            return "WAVE"
+        elif "audio/aiff" in mime_type or "audio/x-aiff" in mime_type:
+            return "AIFF"
+    
+    # Fallback to extension check if mime type is not conclusive
+    suffix = path.suffix.lower()
+    if suffix in [".mp3", ".mp2"]:
+        return "MP3"
+    elif suffix in [".wav", ".wave"]:
+        return "WAVE"
+    elif suffix in [".aiff", ".aif"]:
+        return "AIFF"
+    
+    print(f"⚠️  Warning: Could not determine audio type for {file_path}. Defaulting to MP3.")
+    return "MP3"
 
 
 # type TrackInfo = dict[str, str]
 TracklistHeaders: typing.Mapping[TracklistFormats, str] = {
-    TracklistFormats.Telegram: "**TRACKLIST**"
+    TracklistFormats.Telegram: "**TRACKLIST**",
+    TracklistFormats.CUE: 'PERFORMER "{performer}"\nTITLE "{title}"\nFILE "{file}" {type}'
 }
 
 
@@ -102,6 +178,14 @@ def generate_track(data: typing.Mapping[str, str]) -> str:
     return text
 
 
+def timestamp_to_frames(timestamp: str) -> str:
+    """Convert MM:SS to MM:SS:FF format (75 frames per second)"""
+    parts = timestamp.split(":")
+    if len(parts) == 2:
+        minutes, seconds = map(int, parts)
+        return f"{minutes:02d}:{seconds:02d}:00"
+    return "00:00:00"
+
 def generate_timestamp(
     timestamp: str, data: typing.Mapping[str, str], format=TracklistFormats
 ) -> str:
@@ -113,6 +197,15 @@ def generate_timestamp(
         # Convert MM:SS to [MM:SS.00] format required for lyrics
         return "[{timestamp}.00]{track}".format(
             timestamp=timestamp, track=generate_track(data)
+        )
+    elif format == TracklistFormats.CUE:
+        track_num = data.get("track_num", 1)
+        frames_timestamp = timestamp_to_frames(timestamp)
+        return (
+            f'  TRACK {track_num:02d} AUDIO\n'
+            f'    TITLE "{data["title"]}"\n'
+            f'    PERFORMER "{data["artist"]}"\n'
+            f'    INDEX 01 {frames_timestamp}'
         )
     else:
         return "[{timestamp}] {track}".format(
@@ -194,21 +287,71 @@ for current_format, output_file in output_files.items():
         # Writing header if it exists for the format
         if current_format in TracklistHeaders:
             print("\t🎩  Writing header")
-            file_writer.write(TracklistHeaders[current_format] + "\n")
+            if current_format == TracklistFormats.CUE:
+                audio_type = arguments.audio_type or detect_audio_type(arguments.audio_file)
+                header = TracklistHeaders[current_format].format(
+                    performer=arguments.mix_performer,
+                    title=arguments.mix_title,
+                    file=arguments.audio_file,
+                    type=audio_type
+                )
+            else:
+                header = TracklistHeaders[current_format]
+            file_writer.write(header + "\n")
         
         # Writing tracks
         print("\t📜  Writing track list")
-        for timestamp in tracklist:
+        for track_num, (timestamp, track_data) in enumerate(tracklist.items(), 1):
             print(
                 "\t🎼 {title} at {timestamp}".format(
-                    title=tracklist[timestamp]["title"], timestamp=timestamp
+                    title=track_data["title"], timestamp=timestamp
                 )
             )
+            # Add track number for CUE format
+            if current_format == TracklistFormats.CUE:
+                track_data = track_data.copy()  # Create a copy to avoid modifying original
+                track_data["track_num"] = track_num
+            
             file_writer.write(
                 generate_timestamp(
-                    timestamp, data=tracklist[timestamp], format=current_format
+                    timestamp, data=track_data, format=current_format
                 )
                 + "\n"
             )
         print("\t✅  Format written!")
 print("\n✨ All tracklists written successfully!")
+
+def detect_audio_type(file_path: str) -> str:
+    """Detect the type of audio file and return the appropriate CUE format type."""
+    if not file_path:
+        return "MP3"  # Default if no file specified
+    
+    path = pathlib.Path(file_path)
+    if not path.exists():
+        print(f"⚠️  Warning: Audio file {file_path} not found. Using extension to guess type.")
+    
+    # Initialize mimetypes
+    mimetypes.init()
+    
+    # Get the mime type based on file extension
+    mime_type, _ = mimetypes.guess_type(file_path)
+    
+    if mime_type:
+        if "audio/mpeg" in mime_type or "audio/mp3" in mime_type:
+            return "MP3"
+        elif "audio/wav" in mime_type or "audio/x-wav" in mime_type:
+            return "WAVE"
+        elif "audio/aiff" in mime_type or "audio/x-aiff" in mime_type:
+            return "AIFF"
+    
+    # Fallback to extension check if mime type is not conclusive
+    suffix = path.suffix.lower()
+    if suffix in [".mp3", ".mp2"]:
+        return "MP3"
+    elif suffix in [".wav", ".wave"]:
+        return "WAVE"
+    elif suffix in [".aiff", ".aif"]:
+        return "AIFF"
+    
+    print(f"⚠️  Warning: Could not determine audio type for {file_path}. Defaulting to MP3.")
+    return "MP3"
